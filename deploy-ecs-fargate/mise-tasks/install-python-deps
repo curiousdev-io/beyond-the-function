@@ -2,6 +2,10 @@
 #MISE description="Install runtime and test dependencies into .venv"
 set -euo pipefail
 
+# Named for what it installs, rather than `install`, which would collide with
+# mise's own `mise install` -- that one installs the pinned *tools* (python,
+# the AWS CLI). Two different jobs, and the built-in wins the bare name.
+
 cd "$MISE_PROJECT_ROOT"
 
 # mise created and activated .venv for us via _.python.venv; we only have to

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #MISE description="Run the unit tests"
-#MISE depends=["install"]
+#MISE depends=["install-python-deps"]
 set -euo pipefail
 
 cd "$MISE_PROJECT_ROOT"
