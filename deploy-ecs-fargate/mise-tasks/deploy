@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+#MISE description="Deploy the ECS service stack"
+set -euo pipefail
+
+cd "$MISE_PROJECT_ROOT"
+
+# The VPC and subnets identify someone's specific account, so they come from
+# the environment and nothing is baked into the repo.
+missing=()
+for var in VPC_ID PUBLIC_SUBNET_IDS TASK_SUBNET_IDS; do
+  [[ -n ${!var:-} ]] || missing+=("$var")
+done
+
+if (( ${#missing[@]} > 0 )); then
+  cat >&2 <<EOF
+Missing required variables: ${missing[*]}
+
+Export them, or put them in a gitignored mise.local.toml of your own:
+
+  export VPC_ID=vpc-...
+  export PUBLIC_SUBNET_IDS=subnet-...,subnet-...   # two AZs, for the ALB
+  export TASK_SUBNET_IDS=subnet-...,subnet-...     # where the tasks run
+
+TASK_SUBNET_IDS is the one that decides whether this works on the first try --
+see "VPC requirements" in the README.
+EOF
+  exit 1
+fi
+
+assign_public_ip="${ASSIGN_PUBLIC_IP:-ENABLED}"
+
+# Preflight. Every one of these is a failure that CloudFormation either will
+# not catch, or will catch twenty minutes in after the service fails to
+# stabilise. Checking up front costs one API call each.
+preflight_error() { echo "Preflight failed: $*" >&2; exit 1; }
+
+subnet_json=$(aws ec2 describe-subnets \
+  --subnet-ids ${PUBLIC_SUBNET_IDS//,/ } ${TASK_SUBNET_IDS//,/ } \
+  --query 'Subnets[].{Id:SubnetId,Vpc:VpcId,Az:AvailabilityZone}' --output json) \
+  || preflight_error "could not describe the subnets. Do they exist in ${AWS_REGION}?"
+
+# Subnets from another VPC produce a genuinely baffling stack failure.
+if wrong_vpc=$(echo "$subnet_json" | python3 -c '
+import json, sys
+want = sys.argv[1]
+bad = [s["Id"] for s in json.load(sys.stdin) if s["Vpc"] != want]
+print(",".join(bad))' "$VPC_ID") && [[ -n $wrong_vpc ]]; then
+  preflight_error "these subnets are not in ${VPC_ID}: ${wrong_vpc}"
+fi
+
+# An ALB needs at least two availability zones. This is the single most common
+# reason the stack refuses to create.
+public_azs=$(aws ec2 describe-subnets --subnet-ids ${PUBLIC_SUBNET_IDS//,/ } \
+  --query 'Subnets[].AvailabilityZone' --output text | tr '\t' '\n' | sort -u | wc -l | tr -d ' ')
+if (( public_azs < 2 )); then
+  preflight_error "PUBLIC_SUBNET_IDS covers ${public_azs} availability zone(s); an ALB needs at least 2."
+fi
+
+# Whether the tasks can reach ECR at all. With no route out they fail with
+# CannotPullContainerError, which is the most common failure in this setup and
+# looks nothing like a networking problem when you first read it.
+for subnet in ${TASK_SUBNET_IDS//,/ }; do
+  routes=$(aws ec2 describe-route-tables \
+    --filters "Name=association.subnet-id,Values=${subnet}" \
+    --query 'RouteTables[].Routes[?DestinationCidrBlock==`0.0.0.0/0`].[GatewayId,NatGatewayId][]' \
+    --output text 2>/dev/null | tr -d '\n')
+
+  # No explicit association means the subnet uses the VPC's main route table.
+  if [[ -z $routes ]]; then
+    routes=$(aws ec2 describe-route-tables \
+      --filters "Name=vpc-id,Values=${VPC_ID}" "Name=association.main,Values=true" \
+      --query 'RouteTables[].Routes[?DestinationCidrBlock==`0.0.0.0/0`].[GatewayId,NatGatewayId][]' \
+      --output text 2>/dev/null | tr -d '\n')
+  fi
+
+  case "$routes" in
+    *igw-*)
+      if [[ $assign_public_ip != "ENABLED" ]]; then
+        preflight_error "${subnet} routes to an internet gateway, so tasks there need a public IP to reach ECR. Set ASSIGN_PUBLIC_IP=ENABLED."
+      fi
+      ;;
+    *nat-*)
+      : # A NAT gateway is the right answer; a public IP would be redundant.
+      ;;
+    *)
+      preflight_error "${subnet} has no route to 0.0.0.0/0. Tasks there cannot reach ECR or CloudWatch Logs and will fail with CannotPullContainerError. Use subnets with an internet or NAT gateway, or add ecr.api, ecr.dkr and logs interface endpoints."
+      ;;
+  esac
+done
+
+echo "Preflight passed: ${public_azs} AZs for the ALB, task subnets have a route out."
+
+image_tag="${IMAGE_TAG:-$(git rev-parse --short HEAD)}"
+
+# ProjectName is passed explicitly rather than left to the template's own
+# default. It names the cluster, the roles, the ALB and the log group, so
+# letting it fall back would build a stack full of resources named after
+# something other than PROJECT_NAME -- and it would do it silently.
+#
+# CAPABILITY_NAMED_IAM rather than CAPABILITY_IAM, because the template names
+# its roles.
+aws cloudformation deploy \
+  --stack-name "$SERVICE_STACK_NAME" \
+  --template-file ecs-fargate.yaml \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides \
+    "ProjectName=${PROJECT_NAME}" \
+    "VpcId=${VPC_ID}" \
+    "PublicSubnetIds=${PUBLIC_SUBNET_IDS}" \
+    "TaskSubnetIds=${TASK_SUBNET_IDS}" \
+    "AssignPublicIp=${assign_public_ip}" \
+    "EcrStackName=${ECR_STACK_NAME}" \
+    "ImageTag=${image_tag}"
+
+exec mise run url

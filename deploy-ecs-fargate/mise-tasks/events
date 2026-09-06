@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+#MISE description="Show failed stack events, oldest first"
+set -euo pipefail
+
+stack="${1:-$SERVICE_STACK_NAME}"
+
+# Oldest-first, because the first failure is the real one and the rest are
+# consequences of it.
+exec aws cloudformation describe-stack-events \
+  --stack-name "$stack" \
+  --query 'reverse(StackEvents[?ResourceStatus==`CREATE_FAILED` || ResourceStatus==`UPDATE_FAILED`].[LogicalResourceId,ResourceStatusReason])' \
+  --output text

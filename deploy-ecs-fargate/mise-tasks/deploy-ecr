@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+#MISE description="Deploy the ECR repository stack (do this first)"
+set -euo pipefail
+
+cd "$MISE_PROJECT_ROOT"
+
+# The registry stack is separate on purpose: a service cannot start without an
+# image, and an empty repository cannot produce one, so a combined template
+# fails its first deploy every time.
+#
+# The template is shared with the other examples, but each one deploys its own
+# stack under its own name, so the images and the exports stay separate.
+aws cloudformation deploy \
+  --stack-name "$ECR_STACK_NAME" \
+  --template-file ../shared/ecr-repository.yaml \
+  --parameter-overrides "ProjectName=${PROJECT_NAME}"
+
+aws cloudformation describe-stacks \
+  --stack-name "$ECR_STACK_NAME" \
+  --query 'Stacks[0].Outputs[?OutputKey==`RepositoryUri`].OutputValue' \
+  --output text

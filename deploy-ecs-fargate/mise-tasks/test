@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+#MISE description="Run the unit tests"
+#MISE depends=["install-python-deps"]
+set -euo pipefail
+
+cd "$MISE_PROJECT_ROOT"
+
+# Extra arguments go straight to pytest:  mise run test -- -k goodbye -vv
+exec python -m pytest "$@"

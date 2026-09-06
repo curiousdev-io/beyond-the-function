@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+#MISE description="Print the deployed service URL"
+set -euo pipefail
+
+exec aws cloudformation describe-stacks \
+  --stack-name "$SERVICE_STACK_NAME" \
+  --query 'Stacks[0].Outputs[?OutputKey==`ServiceUrl`].OutputValue' \
+  --output text

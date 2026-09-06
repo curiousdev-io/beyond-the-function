@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+#MISE description="Destroy the ECS service stack -- the ALB and tasks that bill hourly"
+set -euo pipefail
+
+cd "$MISE_PROJECT_ROOT"
+
+# Everything in this stack bills for wall-clock time, not for use. A demo left
+# running over a weekend costs the same as one serving traffic.
+
+if ! state=$(aws cloudformation describe-stacks \
+  --stack-name "$SERVICE_STACK_NAME" \
+  --query 'Stacks[0].StackStatus' --output text 2>&1); then
+  echo "Stack ${SERVICE_STACK_NAME} does not exist in ${AWS_REGION}. Nothing to destroy."
+  exit 0
+fi
+
+echo "About to destroy stack: ${SERVICE_STACK_NAME}"
+echo "Region:                 ${AWS_REGION}"
+echo "Current status:         ${state}"
+echo
+
+# Show what is actually running, so the confirmation is an informed one rather
+# than a reflex.
+running=$(aws ecs describe-services \
+  --cluster "$PROJECT_NAME" --services "$PROJECT_NAME" \
+  --query 'services[0].runningCount' --output text 2>/dev/null || echo "unknown")
+
+cat <<EOF
+This deletes, and they stop billing:
+
+  - the application load balancer, its listener and target group
+    (billed per hour whether or not anything sends it traffic)
+  - the ECS service and its ${running} running task(s)
+    (billed per task for vCPU and memory, by the second)
+  - the ECS cluster, both IAM roles, both security groups,
+    and the task definition
+
+This survives, on purpose:
+
+  - the CloudWatch log group /ecs/${PROJECT_NAME}
+    (DeletionPolicy: Retain -- a teardown should not destroy the logs that
+    explain why you tore it down. Storage only, pennies.)
+  - the ECR repository and its images, which live in the separate
+    ${ECR_STACK_NAME} stack. Storage only.
+
+EOF
+
+if [[ ${FORCE:-} == "1" || ${FORCE:-} == "true" ]]; then
+  echo "FORCE set; skipping confirmation."
+elif [[ -t 0 ]]; then
+  printf 'Type the stack name to confirm: '
+  read -r reply
+  if [[ $reply != "$SERVICE_STACK_NAME" ]]; then
+    echo "Aborted. Nothing was deleted."
+    exit 1
+  fi
+else
+  # No terminal to confirm on. Refusing beats deleting someone's stack because
+  # this ran from a script that did not mean to.
+  echo "Not running interactively, so there is nothing to confirm on." >&2
+  echo "Re-run with FORCE=1 if you really mean it." >&2
+  exit 1
+fi
+
+echo
+echo "Deleting ${SERVICE_STACK_NAME}..."
+aws cloudformation delete-stack --stack-name "$SERVICE_STACK_NAME"
+
+# The wait usually takes a few minutes: the service has to drain and the load
+# balancer has to finish deleting before the stack completes.
+if aws cloudformation wait stack-delete-complete --stack-name "$SERVICE_STACK_NAME"; then
+  echo "Deleted. The load balancer and tasks are no longer billing."
+else
+  echo >&2
+  echo "The delete did not complete cleanly. See what failed with:" >&2
+  echo "  mise run events" >&2
+  exit 1
+fi
+
+cat <<EOF
+
+Still costing you storage, if you want them gone too:
+
+  aws logs delete-log-group --log-group-name "/ecs/${PROJECT_NAME}" --region ${AWS_REGION}
+  aws cloudformation delete-stack --stack-name "${ECR_STACK_NAME}" --region ${AWS_REGION}
+  aws ecr delete-repository --repository-name "${PROJECT_NAME}" --force --region ${AWS_REGION}
+
+The ECR repository is Retain too, so deleting its stack leaves the images
+behind; the third command is what actually removes them.
+EOF

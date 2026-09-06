@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+#MISE description="Run the app locally on $PORT (default 8080)"
+#MISE depends=["install-python-deps"]
+set -euo pipefail
+
+cd "$MISE_PROJECT_ROOT"
+
+export PORT="${PORT:-8080}"
+
+# The default matches the container port, which has to stay 8080 to line up
+# with the task definition and the target group. Locally that is a popular
+# port, so say who is already on it rather than letting gunicorn fail with a
+# bare "Address already in use".
+if holder=$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null) && [[ -n $holder ]]; then
+  echo "Port ${PORT} is already in use:" >&2
+  echo >&2
+  echo "$holder" | sed 's/^/  /' >&2
+  echo >&2
+  echo "Pick another port:  PORT=8081 mise run run-local" >&2
+  exit 1
+fi
+
+echo "Listening on http://localhost:${PORT}"
+echo "  curl \"http://localhost:${PORT}/hello?name=Brian\""
+echo "  curl \"http://localhost:${PORT}/goodbye\""
+echo
+
+# gunicorn with the same config file the image uses, so local output is the
+# same JSON you will read in CloudWatch. --reload is the one difference, and it
+# is the point.
+exec gunicorn --config gunicorn.conf.py --reload app:app

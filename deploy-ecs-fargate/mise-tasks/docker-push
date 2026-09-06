@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+#MISE description="Build the image for $DOCKER_PLATFORM and push it to ECR"
+set -euo pipefail
+
+cd "$MISE_PROJECT_ROOT"
+
+# Default to the commit SHA rather than :latest. Pushing a new image to the
+# same tag does not update the service -- CloudFormation compares templates,
+# the template did not change, so nothing happens.
+image_tag="${IMAGE_TAG:-$(git rev-parse --short HEAD)}"
+
+repo=$(aws cloudformation describe-stacks \
+  --stack-name "$ECR_STACK_NAME" \
+  --query 'Stacks[0].Outputs[?OutputKey==`RepositoryUri`].OutputValue' \
+  --output text)
+
+if [[ -z $repo || $repo == "None" ]]; then
+  echo "No RepositoryUri output on stack ${ECR_STACK_NAME}." >&2
+  echo "Run 'mise run deploy-ecr' first." >&2
+  exit 1
+fi
+
+region="${AWS_REGION:-$(aws configure get region)}"
+if [[ -z $region ]]; then
+  echo "Set AWS_REGION, or configure a default region with 'aws configure'." >&2
+  exit 1
+fi
+
+aws ecr get-login-password --region "$region" \
+  | docker login --username AWS --password-stdin "${repo%%/*}"
+
+# --platform must match CpuArchitecture in ecs-fargate.yaml, or the task dies
+# immediately with an exec format error.
+docker buildx build \
+  --platform "$DOCKER_PLATFORM" \
+  --tag "${repo}:${image_tag}" \
+  --push \
+  .
+
+echo
+echo "Pushed ${repo}:${image_tag}"
+echo "Deploy it with:  IMAGE_TAG=${image_tag} mise run deploy"

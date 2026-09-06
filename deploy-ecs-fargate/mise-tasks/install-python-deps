@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+#MISE description="Install runtime and test dependencies into .venv"
+set -euo pipefail
+
+# Named for what it installs, rather than `install`, which would collide with
+# mise's own `mise install` -- that one installs the pinned *tools* (python,
+# the AWS CLI). Two different jobs, and the built-in wins the bare name.
+
+cd "$MISE_PROJECT_ROOT"
+
+# mise created and activated .venv for us via _.python.venv; we only have to
+# fill it. Skip the pip round-trip when the requirements have not changed,
+# because every other task depends on this one.
+stamp=".venv/.requirements-stamp"
+current=$(cat requirements.txt requirements-dev.txt | shasum -a 256 | cut -d' ' -f1)
+
+if [[ -f $stamp && $(cat "$stamp") == "$current" ]]; then
+  echo "Dependencies up to date."
+  exit 0
+fi
+
+python -m pip install --quiet --upgrade pip
+python -m pip install --quiet -r requirements-dev.txt
+
+echo "$current" > "$stamp"
+echo "Installed dependencies into $(python -c 'import sys; print(sys.prefix)')"

@@ -1,0 +1,90 @@
+#
+# Tooling and tasks for the ECS Fargate example.
+#
+# Inherits aws-cli from the repo-root mise.toml. Run everything from this
+# directory:
+#
+#   mise install               install python and the shared toolchain
+#   mise install-python-deps   create .venv and install this project's deps
+#   mise test                  run the unit tests
+#   mise tasks                 list everything else
+#
+# The first two are different jobs: `mise install` is mise's own command and
+# installs the pinned tools, while install-python-deps is a task here that
+# fills the virtualenv. The built-in wins the bare name, hence the longer one.
+#
+# Task bodies are plain shell scripts in mise-tasks/, so they can be run
+# directly, shellcheck'd, and reviewed like any other code.
+#
+
+[settings]
+# Without this, mise resolves 3.14 to a free-threaded python-build-standalone
+# build and then fails to install it ("Python installation is missing a `lib`
+# directory"). The image is a normal GIL build, so match it here too.
+python.precompiled_flavor = "install_only_stripped"
+
+[tools]
+# Tracks the same tag as the Dockerfile (python:3.14-slim-bookworm). If you pin
+# a patch version in one place, pin it in the other -- drift between the local
+# interpreter and the image is the whole reason this is written down.
+python = "3.14"
+
+[env]
+# A virtualenv per checkout, created on activation and populated by
+# `mise install-python-deps`. Keeps pip out of the toolchain's own site-packages.
+#
+# --seed because mise builds the venv with uv when it can, and uv leaves pip
+# out by default. The image installs with pip, so the tasks do too.
+_.python.venv = { path = "{{config_root}}/.venv", create = true, uv_create_args = [
+  "--seed",
+] }
+
+# Every value below is a default that the environment overrides. Nothing
+# account-specific is committed here: no account ids, VPC ids, or subnet ids
+# appear anywhere in this repo. Those come from the environment and have no
+# defaults at all -- see "VPC requirements" in the README.
+#
+# Region has a default so the tasks do not silently follow whatever
+# `aws configure` happens to say on the machine running them.
+AWS_REGION = "{{ env.AWS_REGION | default(value='us-east-1') }}"
+
+# PROJECT_NAME is the single source of truth; the stack names derive from it.
+#
+# These are two different kinds of name, and it is worth being explicit about
+# which is which:
+#
+#   PROJECT_NAME       names AWS *resources* -- the cluster, the service, the
+#                      task family, the log group /ecs/<name>, <name>-alb,
+#                      <name>-tg, and the <name>-execution and <name>-task
+#                      IAM roles.
+#   SERVICE_STACK_NAME names the *CloudFormation stack*, and keys its exports.
+#   ECR_STACK_NAME     names the registry stack, whose exports the service
+#                      stack imports by name.
+#
+# Holding them equal by derivation rather than by three literals that happen to
+# agree matters, because drift here does not error -- it succeeds quietly and
+# wrongly. A stack whose resources are named after the previous value, a
+# `mise run logs` tailing a log group that does not exist, and an import of
+# "<old>-ecr-RepositoryUri" that no longer resolves.
+#
+# PROJECT_NAME must be unique per *account*, not per region: ALB and target
+# group names are per-region, but IAM role names are global, so the same
+# PROJECT_NAME deployed to two regions collides on <name>-execution.
+#
+# Export PROJECT_NAME to override it; the other two follow.
+PROJECT_NAME = "{{ env.PROJECT_NAME | default(value='curiousdev-fargate-demo') }}"
+ECR_STACK_NAME = "{{ env.PROJECT_NAME | default(value='curiousdev-fargate-demo') }}-ecr"
+SERVICE_STACK_NAME = "{{ env.PROJECT_NAME | default(value='curiousdev-fargate-demo') }}"
+
+# Must match CpuArchitecture in ecs-fargate.yaml. A mismatch gets you a task
+# that dies immediately with an exec format error.
+DOCKER_PLATFORM = "{{ env.DOCKER_PLATFORM | default(value='linux/arm64') }}"
+
+# Deploying the service additionally needs VPC_ID, PUBLIC_SUBNET_IDS, and
+# TASK_SUBNET_IDS. They are deliberately not defined here and have no defaults,
+# because they identify someone's specific account. Export them, or put them in
+# a gitignored mise.local.toml of your own; `mise run deploy` states exactly
+# what is missing and what it has to satisfy.
+
+[task_config]
+dir = "{{config_root}}"

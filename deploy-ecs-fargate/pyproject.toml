@@ -1,0 +1,11 @@
+#
+# Config only -- this example is a flat app.py plus a Dockerfile, not a
+# packaged distribution, so there is no [project] table and nothing to build.
+#
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# app.py sits at the root of this example rather than in a package, so put that
+# root on sys.path instead of making the tests do sys.path surgery.
+pythonpath = ["."]
+addopts = "-q --strict-markers --strict-config"

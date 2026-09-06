@@ -1,0 +1,136 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  ECR repository for one of the examples in this repo. Deploy this stack first,
+  push an image into it, then deploy that example's service template.
+
+# Shared by every example here, because a registry is a registry and this
+# template is generic. Each example deploys its own stack under its own name:
+# the repository is named after ProjectName and the exports are keyed on
+# AWS::StackName, so two examples never collide, and tearing one down leaves
+# the others alone.
+#
+# Why this is a separate stack from the service:
+#
+# A service cannot start without an image, and an empty repository cannot
+# produce one. Put both in the same template and the first deploy always fails
+# the same way: repository created, tasks cannot pull, circuit breaker trips,
+# stack rolls back, and the rollback deletes the repository you were about to
+# push to.
+#
+# Registries also outlive the things they feed. Tearing down a service should
+# not take your images with it.
+#
+# Deploy with, from an example directory:
+#   aws cloudformation deploy \
+#     --stack-name curiousdev-demo-ecr \
+#     --template-file ../shared/ecr-repository.yaml \
+#     --parameter-overrides ProjectName=curiousdev-demo
+#
+# ...or just `mise run deploy-ecr`.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: curiousdev-demo
+    MaxLength: 24
+    AllowedPattern: "[a-z0-9][a-z0-9-]*"
+    Description: >
+      Repository name. Must match the ProjectName you pass to the service
+      stack if you are letting that stack resolve the image URI for you.
+
+  ImageTagMutability:
+    Type: String
+    Default: MUTABLE
+    AllowedValues: [MUTABLE, IMMUTABLE]
+    Description: >
+      MUTABLE lets you keep overwriting a :latest tag, which is convenient for
+      a demo and a bad idea in production. IMMUTABLE forces a unique tag per
+      build, which is what you want once deploys matter.
+
+  UntaggedExpiryDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    Description: Days before untagged image layers are cleaned up.
+
+  MaxImageCount:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    Description: How many images to keep before the oldest are expired.
+
+Resources:
+  Repository:
+    Type: AWS::ECR::Repository
+    # Keep the images if the stack goes away. Deleting a stack should not be
+    # how you lose the artifact you are trying to roll back to.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Ref ProjectName
+      ImageTagMutability: !Ref ImageTagMutability
+
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+      EncryptionConfiguration:
+        EncryptionType: AES256
+
+      # Untagged layers accumulate quietly and you pay for all of them.
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after ${UntaggedExpiryDays} days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": ${UntaggedExpiryDays}
+                },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep only the ${MaxImageCount} most recent images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": ${MaxImageCount}
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  RepositoryUri:
+    Description: Push target, and the value the service stack imports.
+    Value: !GetAtt Repository.RepositoryUri
+    Export:
+      # The service stack looks for exactly this export name.
+      Name: !Sub "${AWS::StackName}-RepositoryUri"
+
+  RepositoryName:
+    Value: !Ref Repository
+    Export:
+      Name: !Sub "${AWS::StackName}-RepositoryName"
+
+  RepositoryArn:
+    Value: !GetAtt Repository.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-RepositoryArn"
+
+  LoginCommand:
+    Description: Authenticate Docker against this registry.
+    Value: !Sub "aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com"
+
+  BuildAndPushCommand:
+    Description: Build for the task architecture and push. Change linux/arm64 to linux/amd64 if you set CpuArchitecture to X86_64.
+    Value: !Sub "docker buildx build --platform linux/arm64 -t ${Repository.RepositoryUri}:latest --push ."
