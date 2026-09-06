@@ -4,6 +4,11 @@ This repository contains companion code for [Zero to Running Task: Your First EC
 
 This project uses AWS CloudFormation to deploy a container image and a Flask application and it as a load-balanced service on Amazon ECS Fargate.
 
+> [!WARNING]
+> **This demo costs money to run, and the meter keeps running until you delete it.**
+>
+> **When you are done, run `mise nuke-fargate-demo`.** See [Tearing down](#tearing-down) for what it removes and what it deliberately leaves behind.
+
 | File | What it is |
 | --- | --- |
 | `app.py` | Flask app with `/hello`, `/goodbye`, and `/health` routes |
@@ -40,11 +45,13 @@ curl https://mise.run | sh  # everything else
 Then, from this directory:
 
 ```bash
-mise trust            # required once
-mise install          # python and the aws cli, at the pinned versions
-mise run install      # create .venv and install dependencies
-mise tasks            # everything you can run
+mise trust                 # required once
+mise install               # the pinned tools: python and the aws cli
+mise install-python-deps   # create .venv and install this project's dependencies
+mise tasks                 # everything you can run
 ```
+
+Those two installs are different jobs, which is why the task is not simply called `install`: `mise install` is mise's own command and installs the *tools* pinned in `mise.toml`, while `install-python-deps` is a task in this project that fills the virtualenv from `requirements-dev.txt`. The built-in wins the bare name, so the task says what it actually does.
 
 You also need **Docker** for `docker-push`, and AWS credentials with permission to create ECR, ECS, ELB, IAM, and CloudWatch Logs resources.
 
@@ -52,8 +59,8 @@ Everything below runs through `mise`, which does not require mise to be activate
 
 | Task | What it does |
 | --- | --- |
-| `mise install` | Create `.venv` and install `requirements-dev.txt` |
-| `mise test` | Run the unit tests. Extra args reach pytest: `mise run test -- -k goodbye` |
+| `mise install-python-deps` | Create `.venv` and install `requirements-dev.txt` |
+| `mise test` | Run the unit tests. Extra args reach pytest: `mise test -- -k goodbye` |
 | `mise run-local` | Serve on localhost under gunicorn, with `--reload` |
 | `mise deploy-ecr` | Deploy the registry stack |
 | `mise docker-push` | Build for the right architecture and push to ECR |
@@ -143,7 +150,7 @@ PORT=8081 mise run-local
 Test it:
 
 ```bash
-mise run test
+mise test
 ```
 
 ## Logs
@@ -178,11 +185,7 @@ You need a VPC with at least two subnets in different availability zones, and so
 
 Each step below is spelled out as the raw AWS CLI command, because knowing what the tooling is doing is most of the point. Each one also has a task — `mise deploy-ecr`, `docker-push`, `deploy`, `url` — which is what you will actually reach for on the second run. The tasks tag images with the commit SHA rather than `latest`, for the reason in "Redeploying after a code change".
 
-> [!WARNING]
-> What you are about to deploy costs money for as long as it exists. The load
-> balancer bills per hour whether or not anyone uses it, and the two Fargate
-> tasks bill per second. Run `mise nuke-fargate-demo` when you are finished —
-> see [Tearing down](#tearing-down).
+Everything from here on costs money for as long as it exists. See the warning at the top, and [Tearing down](#tearing-down) when you are finished.
 
 ### 1. Create the registry
 
@@ -344,30 +347,10 @@ A stack in `ROLLBACK_COMPLETE` cannot be updated. Delete it and deploy again.
 
 ## Tearing down
 
-> [!WARNING]
-> **This stack bills for wall-clock time, not for use.** Once it is deployed it
-> keeps charging you until you delete it — a demo left running over a weekend
-> costs exactly the same as one serving production traffic. Nobody has to visit
-> the URL for the meter to run.
->
-> The two things that cost real money:
->
-> - **The application load balancer**, billed per hour from the moment it
->   exists, plus capacity units. This is the larger of the two and it does not
->   scale down to nothing when idle.
-> - **The Fargate tasks**, billed per task for vCPU and memory by the second.
->   The default `DesiredCount` is 2, so you are paying for two of them.
->
-> Together, on the defaults, that lands in the region of tens of dollars a
-> month — enough to notice on a personal account, and it accrues silently.
-> Check current [Fargate](https://aws.amazon.com/fargate/pricing/) and
-> [ELB](https://aws.amazon.com/elasticloadbalancing/pricing/) pricing for real
-> numbers; they vary by region and change over time.
->
-> **When you are finished with the demo, destroy it.**
+The load balancer and the Fargate tasks bill for as long as they exist, so tear the demo down when you are finished with it:
 
 ```bash
-mise run nuke-fargate-demo
+mise nuke-fargate-demo
 ```
 
 It shows you what is about to go, including how many tasks are currently
@@ -392,7 +375,7 @@ Type the stack name to confirm:
 
 Anything other than the exact stack name aborts without deleting. It also
 refuses to run non-interactively, so a script that invokes it by accident
-cannot destroy a stack with nobody watching — `FORCE=1 mise run nuke-fargate-demo`
+cannot destroy a stack with nobody watching — `FORCE=1 mise nuke-fargate-demo`
 is the deliberate override for a pipeline.
 
 ### What survives, and why
