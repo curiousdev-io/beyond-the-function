@@ -1,0 +1,17 @@
+#
+# Repo-wide tooling for the beyond-the-function demos.
+#
+# Every example deploys to AWS, so the CLI is pinned here once. Anything an
+# example needs for itself -- a language runtime, its stack names, its tasks --
+# lives in that example's own mise.toml. mise merges this file into the config
+# it finds when you cd into the example, so you get both.
+#
+#   mise install                       install the shared toolchain
+#   cd deploy-ecs-fargate && mise tasks   see what that example can do
+#
+
+[tools]
+aws-cli = "2.36.40"
+
+[task_config]
+dir = "{{config_root}}"

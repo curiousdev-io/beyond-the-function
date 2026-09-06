@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+#MISE description="Exercise every route against the deployed load balancer"
+set -euo pipefail
+
+cd "$MISE_PROJECT_ROOT"
+
+# The name to greet. Takes an argument, falls back to $NAME, then to the app's
+# own default so that `mise run smoke` on its own still does something useful:
+#
+#   mise run smoke
+#   mise run smoke -- Brian
+#   mise run smoke -- "Ada Lovelace"
+#   NAME=Brian mise run smoke
+name="${1:-${NAME:-World}}"
+
+# Ask the url task rather than repeating the describe-stacks query. It is a
+# plain script, so running it directly gives just the URL on stdout.
+#
+# Captured with 2>&1 so that a failure carries the CLI's own explanation --
+# without it, `set -e` kills this script inside the substitution and the hint
+# below never prints.
+if ! url=$("${MISE_PROJECT_ROOT}/mise-tasks/url" 2>&1) || [[ -z $url || $url == "None" ]]; then
+  echo "Could not read the service URL from stack ${SERVICE_STACK_NAME}:" >&2
+  echo "  ${url:-no ServiceUrl output on the stack}" >&2
+  echo >&2
+  echo "Is the service deployed? Try 'mise run deploy'." >&2
+  exit 1
+fi
+
+echo "Exercising ${url}"
+echo "Greeting as \"${name}\""
+echo
+
+passed=0
+failed=0
+
+# check <label> <path> <want_status> <field> <want_value> [extra curl args...]
+#
+# Compares the HTTP status and one field of the JSON body. Checking a field
+# rather than the whole body means these do not break every time a key is added.
+check() {
+  local label=$1 path=$2 want_status=$3 field=$4 want_value=$5
+  shift 5
+
+  local response status body actual
+  if ! response=$(curl -sS -w '\n%{http_code}' --max-time 10 "$@" "${url}${path}" 2>&1); then
+    printf '  %-34s FAIL  request failed: %s\n' "$label" "$response"
+    (( ++failed ))
+    return
+  fi
+
+  status=${response##*$'\n'}
+  body=${response%$'\n'*}
+  # jsonify ends its body with a newline of its own, which would otherwise
+  # break the one-line-per-route layout.
+  body=${body%$'\n'}
+
+  if [[ $status != "$want_status" ]]; then
+    printf '  %-34s FAIL  expected HTTP %s, got %s\n' "$label" "$want_status" "$status"
+    printf '  %-34s       %s\n' "" "$body"
+    (( ++failed ))
+    return
+  fi
+
+  # Pull one field out of the JSON. Falls back to a marker rather than dying, so
+  # a non-JSON body reports as a mismatch instead of a stack trace.
+  actual=$(printf '%s' "$body" | python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin).get(sys.argv[1], "<missing>"))
+except Exception:
+    print("<not json>")' "$field")
+
+  if [[ $actual != "$want_value" ]]; then
+    printf '  %-34s FAIL  %s was %s, expected %s\n' "$label" "$field" "\"$actual\"" "\"$want_value\""
+    (( ++failed ))
+    return
+  fi
+
+  printf '  %-34s %s   %s\n' "$label" "$status" "$body"
+  (( ++passed ))
+}
+
+# --data-urlencode with -G so a name with spaces or an ampersand is encoded
+# properly rather than corrupting the query string.
+check "GET /health"        /health  200 status  ok
+check "GET /"              /        200 service ecs-fargate-demo
+check "GET /hello"         /hello   200 message "Hello, ${name}!"   -G --data-urlencode "name=${name}"
+check "GET /goodbye"       /goodbye 200 message "Goodbye, ${name}!" -G --data-urlencode "name=${name}"
+
+# Not a route. Included because the 404 handler returning JSON rather than
+# werkzeug's HTML page is a deliberate feature worth catching a regression in.
+check "GET /nope (404)"    /nope    404 error   "not found"
+
+echo
+if (( failed > 0 )); then
+  echo "${passed} passed, ${failed} failed" >&2
+  exit 1
+fi
+
+echo "${passed} passed"

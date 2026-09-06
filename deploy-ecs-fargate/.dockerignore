@@ -1,0 +1,22 @@
+# This directory is the build context (`docker buildx build ... .` from here),
+# and docker only reads .dockerignore from the context root -- the one at the
+# repo root does not apply to this build.
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.venv
+venv
+
+.git
+.gitignore
+
+# Deployment and tooling, none of which belongs in the image.
+*.yaml
+*.yml
+README.md
+mise.toml
+mise.local.toml
+mise-tasks
+pyproject.toml
+requirements-dev.txt
+tests

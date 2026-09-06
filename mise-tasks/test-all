@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+#MISE description="Run every example's test task"
+set -euo pipefail
+
+cd "$MISE_PROJECT_ROOT"
+
+failed=()
+
+for task in */mise-tasks/test; do
+  [[ -f $task ]] || continue
+  example=${task%%/*}
+
+  echo "==> ${example}"
+  # Each example has its own config and virtualenv, so run the task from
+  # inside it and let mise pick that config up.
+  if (cd "$example" && mise run test); then
+    echo
+  else
+    failed+=("$example")
+    echo
+  fi
+done
+
+if (( ${#failed[@]} > 0 )); then
+  echo "FAILED: ${failed[*]}" >&2
+  exit 1
+fi
+
+echo "All examples passed."

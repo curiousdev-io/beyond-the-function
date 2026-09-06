@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+#MISE description="Tail the service's CloudWatch logs"
+set -euo pipefail
+
+# The log group is named after PROJECT_NAME, not the stack -- the template
+# creates it as /ecs/${ProjectName}. Those two values are equal by derivation,
+# but reading the right one means this keeps working if that ever changes.
+#
+# Extra arguments go to `aws logs tail`:  mise run logs -- --since 1h
+exec aws logs tail "/ecs/${PROJECT_NAME}" --follow "$@"

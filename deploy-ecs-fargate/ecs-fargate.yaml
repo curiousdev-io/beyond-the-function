@@ -1,0 +1,499 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  A load-balanced ECS service on Fargate: cluster, task definition, ALB,
+  target group, listener, two security groups, and two IAM roles.
+  Companion template for "Zero to Running Task: Your First ECS Service".
+
+# Deploy ecr-repository.yaml FIRST and push an image into it. A service with
+# nothing to pull will trip the deployment circuit breaker and roll the whole
+# stack back.
+#
+# Deploy with:
+#   aws cloudformation deploy \
+#     --stack-name curiousdev-demo \
+#     --template-file ecs-fargate-cloudformation.yaml \
+#     --capabilities CAPABILITY_NAMED_IAM \
+#     --parameter-overrides \
+#         VpcId=vpc-xxxxxxxx \
+#         PublicSubnetIds=subnet-aaa,subnet-bbb \
+#         TaskSubnetIds=subnet-ccc,subnet-ddd \
+#         EcrStackName=curiousdev-demo-ecr
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Naming
+        Parameters:
+          - ProjectName
+      - Label:
+          default: Networking
+        Parameters:
+          - VpcId
+          - PublicSubnetIds
+          - TaskSubnetIds
+          - AssignPublicIp
+      - Label:
+          default: Container image
+        Parameters:
+          - EcrStackName
+          - ImageTag
+          - ContainerImage
+      - Label:
+          default: Container
+        Parameters:
+          - ContainerPort
+          - HealthCheckPath
+      - Label:
+          default: Sizing
+        Parameters:
+          - DesiredCount
+          - TaskCpu
+          - TaskMemory
+          - CpuArchitecture
+      - Label:
+          default: Observability
+        Parameters:
+          - LogRetentionInDays
+          - ContainerInsights
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: curiousdev-demo
+    MaxLength: 24
+    AllowedPattern: "[a-z0-9][a-z0-9-]*"
+    Description: >
+      Prefix for every named resource. Kept short because ALB and target group
+      names are capped at 32 characters.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC that will hold the load balancer and the tasks.
+
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      At least two public subnets in different AZs, for the load balancer.
+
+  TaskSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      Subnets for the tasks themselves. Private subnets are the right answer,
+      but they need a NAT gateway or VPC endpoints so tasks can reach ECR and
+      CloudWatch Logs. If you do not have that, pass public subnets here and
+      set AssignPublicIp to ENABLED.
+
+  AssignPublicIp:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: >
+      ENABLED only makes sense when TaskSubnetIds are public subnets. Getting
+      this wrong is the usual cause of CannotPullContainerError.
+
+  EcrStackName:
+    Type: String
+    Default: curiousdev-demo-ecr
+    Description: >
+      Stack name you used for ecr-repository.yaml. The repository URI is
+      imported from that stack's exports, so CI can push and deploy without
+      anyone pasting an account ID around. Ignored if ContainerImage is set.
+
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: >
+      Tag to deploy from the imported repository. Use an immutable tag such as
+      a commit SHA in anything you care about: with ":latest", pushing a new
+      image does not update the service, because the template did not change.
+
+  ContainerImage:
+    Type: String
+    Default: ""
+    Description: >
+      Optional escape hatch. Set a full image URI here to bypass EcrStackName
+      entirely, for example to smoke-test with a public image.
+
+  ContainerPort:
+    Type: Number
+    Default: 8080
+    MinValue: 1
+    MaxValue: 65535
+
+  HealthCheckPath:
+    Type: String
+    Default: /health
+    Description: >
+      Must return a 200. Tasks that fail this check are killed and replaced,
+      forever, without ever telling you why.
+
+  DesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 0
+
+  TaskCpu:
+    Type: String
+    Default: "256"
+    AllowedValues: ["256", "512", "1024", "2048", "4096"]
+    Description: CPU units. Only certain CPU/memory pairs are valid on Fargate.
+
+  TaskMemory:
+    Type: String
+    Default: "512"
+    Description: >
+      Memory in MiB. Valid pairings, abbreviated: 256 CPU takes 512/1024/2048,
+      512 CPU takes 1024 through 4096, 1024 CPU takes 2048 through 8192.
+
+  CpuArchitecture:
+    Type: String
+    Default: ARM64
+    AllowedValues: [ARM64, X86_64]
+    Description: >
+      ARM64 is Graviton: cheaper per task, same code, as long as your image
+      was built for it.
+
+  LogRetentionInDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 3653]
+
+  ContainerInsights:
+    Type: String
+    Default: enabled
+    AllowedValues: [enabled, disabled]
+    Description: Costs a little money, buys task-level CPU and memory metrics.
+
+Conditions:
+  # An explicit ContainerImage wins; otherwise resolve the URI from the ECR stack.
+  UseExplicitImage: !Not [!Equals [!Ref ContainerImage, ""]]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Cluster: a logical boundary. It does not provision anything by itself.
+  # FARGATE and FARGATE_SPOT already exist in every account; we are only
+  # declaring which ones this cluster may draw from.
+  # ---------------------------------------------------------------------------
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ProjectName
+      ClusterSettings:
+        - Name: containerInsights
+          Value: !Ref ContainerInsights
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+
+  # ---------------------------------------------------------------------------
+  # Logs. The awslogs driver will not create this group for you, and a task
+  # that cannot write logs fails to start.
+  # ---------------------------------------------------------------------------
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    # Retain so a stack rollback does not destroy the logs explaining the failure.
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}"
+      RetentionInDays: !Ref LogRetentionInDays
+
+  # ---------------------------------------------------------------------------
+  # Two roles, two different questions.
+  #
+  #   Execution role: "can the ECS agent set this task up?"  Used AROUND your
+  #   container, by the agent: pull the image, ship the logs, resolve secrets.
+  #
+  #   Task role: "what can my application call?"  Used INSIDE your container,
+  #   by your code. This is the one that corresponds to a Lambda execution role.
+  #
+  # Both are assumed by the same principal, which is exactly why they get
+  # confused. Attaching your app's permissions to the execution role fails at
+  # runtime, not at deploy.
+  # ---------------------------------------------------------------------------
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-execution"
+      Description: Lets the ECS agent pull images and ship container logs.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-task"
+      Description: What your application code is allowed to do.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        # The only thing here is ECS Exec, which is a debugging channel rather
+        # than an application permission. Add your app's S3/DynamoDB/SNS access
+        # below, scoped the same way you would scope a Lambda role.
+        - PolicyName: EcsExec
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: "*"
+
+  # ---------------------------------------------------------------------------
+  # The blueprint. Cpu and Memory are typed String here: quote them, or
+  # CloudFormation rejects the number YAML hands it.
+  # ---------------------------------------------------------------------------
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref ProjectName
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: !Ref CpuArchitecture
+
+      ContainerDefinitions:
+        - Name: app
+          Image: !If
+            - UseExplicitImage
+            - !Ref ContainerImage
+            - !Sub
+              - "${RepositoryUri}:${ImageTag}"
+              - RepositoryUri:
+                  Fn::ImportValue: !Sub "${EcrStackName}-RepositoryUri"
+          Essential: true
+
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+
+          Environment:
+            - Name: PORT
+              Value: !Ref ContainerPort
+
+          # Container definition keys are PascalCase, but the awslogs options
+          # underneath are literal driver keys and stay lowercase.
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app
+
+  # ---------------------------------------------------------------------------
+  # Security groups. GroupDescription is required. There is deliberately no
+  # SecurityGroupEgress: omitting it leaves EC2's default allow-all outbound
+  # rule in place, which the tasks need to reach ECR and CloudWatch Logs.
+  # ---------------------------------------------------------------------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public ingress to the load balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP from anywhere
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-alb"
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Tasks, reachable only from the load balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          # A security group, not a CIDR block. Your tasks are not reachable
+          # from the internet at all, only through the load balancer.
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: Application traffic from the ALB
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-task"
+
+  # ---------------------------------------------------------------------------
+  # The front door. Lambda gave you an invocation endpoint for free.
+  # ---------------------------------------------------------------------------
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-alb"
+      Type: application
+      Scheme: internet-facing
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-tg"
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      # Not "instance". awsvpc gives every task its own ENI and IP, so the
+      # load balancer targets IPs. The default silently registers nothing.
+      TargetType: ip
+
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      HealthCheckTimeoutSeconds: 5
+      HealthCheckIntervalSeconds: 30
+      Matcher:
+        HttpCode: "200"
+
+      TargetGroupAttributes:
+        # Default is 300s, which makes every deploy feel broken.
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ---------------------------------------------------------------------------
+  # The service: the resource that actually makes containers exist, and keeps
+  # DesiredCount of them running without anyone being paged.
+  # ---------------------------------------------------------------------------
+  Service:
+    Type: AWS::ECS::Service
+    # Nothing in the properties below references the listener, so CloudFormation
+    # cannot infer this ordering. Without it you get an intermittent failure
+    # that passes on a retry and fails again on a fresh account.
+    DependsOn: Listener
+    Properties:
+      ServiceName: !Ref ProjectName
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+
+      # Do not add LaunchType alongside this. It is one or the other, and the
+      # conflict fails during CREATE_IN_PROGRESS, rolling back the whole stack.
+      CapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref TaskSubnetIds
+          SecurityGroups:
+            - !Ref TaskSecurityGroup
+          # A string, not a boolean. ENABLED or DISABLED.
+          AssignPublicIp: !Ref AssignPublicIp
+
+      LoadBalancers:
+        - TargetGroupArn: !Ref TargetGroup
+          ContainerName: app
+          ContainerPort: !Ref ContainerPort
+
+      DeploymentConfiguration:
+        # If a deployment cannot stabilize, ECS gives up and reverts to the
+        # previous task definition on its own.
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+
+      # Set this above your real startup time. The stack sits in
+      # CREATE_IN_PROGRESS until the service stabilizes, so a flapping health
+      # check turns into a very long, very quiet wait.
+      HealthCheckGracePeriodSeconds: 60
+
+      # ECS Exec. On Fargate it is the only way into a running container,
+      # and it needs the ssmmessages permissions on the TASK role above.
+      EnableExecuteCommand: true
+
+      PropagateTags: SERVICE
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  ServiceUrl:
+    Description: Hit this in a browser. That is your app.
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+
+  HelloExample:
+    Description: Example request against the /hello route.
+    Value: !Sub "http://${LoadBalancer.DNSName}/hello?name=Brian"
+
+  GoodbyeExample:
+    Description: Example request against the /goodbye route.
+    Value: !Sub "http://${LoadBalancer.DNSName}/goodbye?name=Brian"
+
+  DeployedImage:
+    Description: The image URI this stack actually resolved to.
+    Value: !If
+      - UseExplicitImage
+      - !Ref ContainerImage
+      - !Sub
+        - "${RepositoryUri}:${ImageTag}"
+        - RepositoryUri:
+            Fn::ImportValue: !Sub "${EcrStackName}-RepositoryUri"
+
+  ClusterName:
+    Value: !Ref Cluster
+    Export:
+      Name: !Sub "${AWS::StackName}-ClusterName"
+
+  ServiceName:
+    Value: !GetAtt Service.Name
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceName"
+
+  LogGroupName:
+    Description: aws logs tail <this> --follow
+    Value: !Ref LogGroup
+
+  TaskSecurityGroupId:
+    Value: !Ref TaskSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-TaskSecurityGroupId"
+
+  TaskRoleArn:
+    Description: Attach your application's own permissions to this role.
+    Value: !GetAtt TaskRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-TaskRoleArn"
